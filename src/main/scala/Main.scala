@@ -2,9 +2,11 @@ import java.io.{FileInputStream, File, OutputStream, InputStream}
 import java.net.{URL, URI}
 import java.nio.file.{Paths, StandardCopyOption, Files}
 import akka.actor.{Props, ActorSystem, Actor, ActorLogging}
-import akka.util.Timeout
+import akka.stream.{ActorMaterializer, IOResult}
+import akka.stream.scaladsl.{StreamConverters, FileIO, Source}
+import akka.util.{ByteString, Timeout}
 import com.typesafe.config.ConfigFactory
-import scala.concurrent.Await
+import scala.concurrent.{Future, Await}
 import scala.sys.process.{Process, ProcessIO}
 
 object Helpers {
@@ -40,41 +42,28 @@ object Helpers {
 object Protocol {
   case class RequestClip(input: InputStream, start: BigDecimal, end: BigDecimal)
 
-  case class Clip(stream: InputStream)
+  case class Clip(video: Source[ByteString, Future[IOResult]])
 
   case class ProcessReaper(process: Process, exitValue: Long)
 }
 
 class FFmpegActor extends Actor with ActorLogging {
 
-  import Helpers._
   import Protocol._
+  import scala.sys.process._
 
   val ffmpeg = "ffmpeg" // Path to your ffmpeg binary. You can `brew install ffmpeg` if you don't have one.
 
   def receive = {
     case RequestClip(input, start, end) =>
-  
-      log.debug("clip requested at start {} and end {}", start, end)
 
-      // ffmpeg -threads 2 -i sample.mp4 -y -c:v copy -c:a copy -ss 4 -to 12 -f mp4 -movflags frag_keyframe+empty_moov clip.mp4
       val clipCommand = s"$ffmpeg -threads 2 -i pipe:0 -y -c:v copy -c:a copy -ss $start -to $end -f mp4 -movflags frag_keyframe+empty_moov pipe:1"
 
-      val stdout: InputStream => Unit = { stream =>
-        log.debug("forwarding stream to sender")
-        sender() ! Clip(stream)
-      }
-      
-      val stderr: InputStream => Unit = _ => ()
-    
-      val process = Process(clipCommand).run(new ProcessIO(PipeToStdIn(input, log.debug("wrote {} bytes to stdin", _)), stdout, stderr))
-    
-      log.debug("executed command: {}", clipCommand)
-    
-      self ! ProcessReaper(process, process.exitValue) // Blocks until exit.
-    
-    case ProcessReaper(process, exitValue) =>
-      log.debug("exit ffmpeg clipping process with exit code of {}", exitValue)
+      val tmp = new File("clip.tmp")
+
+      clipCommand #< input #> tmp !
+
+      sender() ! Clip(FileIO.fromFile(tmp))
   }
 }
 
@@ -82,6 +71,8 @@ object Main extends App {
 
   val system = ActorSystem("example", ConfigFactory.load())
   import system.dispatcher
+
+  implicit val materializer = ActorMaterializer()(system)
 
   val ffmpeg = system.actorOf(Props[FFmpegActor])
 
@@ -91,23 +82,27 @@ object Main extends App {
 
   implicit val timeout = Timeout(30 seconds)
 
-  import scala.sys.process._
-
   // Download a sample video:
   val sample = new File("sample.mp4")
-  if(!sample.exists()) new URL("http://www.sample-videos.com/video/mp4/720/big_buck_bunny_720p_5mb.mp4") #> sample !
+  if(!sample.exists()) {
+    import scala.sys.process._
+    val download = new File("download")
+    new URL("http://www.sample-videos.com/video/mp4/720/big_buck_bunny_720p_5mb.mp4") #> download !
+
+    "qt-faststart download sample.mp4".!
+    download.delete()
+  }
+
 
   // Request a clip starting at 4 seconds, through to 12 second mark.
   val request = ffmpeg ? RequestClip(new FileInputStream(sample), start = 4, end = 12)
 
   // Write the resulting InputStream to a file.
   // It should be about ~526,890 bytes, NOT ~1243!!!
-  val result = request.mapTo[Clip] map {
+  val result = request flatMap {
     case Clip(output) =>
-      Files.copy(output, Paths.get("clip.mp4"), StandardCopyOption.REPLACE_EXISTING)
+      output.runWith(FileIO.toFile(new File("clip.mp4")))
+  } foreach { _ =>
+    system.terminate()
   }
-
-  Await.result(result, 30 seconds)
-
-  system.terminate()
 }
